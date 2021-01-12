@@ -10,6 +10,7 @@
 
 #include "fu-chunk.h"
 #include "fu-common.h"
+#include "fu-synaptics-rmi-firmware.h"
 #include "fu-synaptics-rmi-v5-device.h"
 
 #include "fwupd-error.h"
@@ -18,6 +19,7 @@
 #define RMI_F34_ERASE_ALL				0x03
 #define RMI_F34_WRITE_LOCKDOWN_BLOCK			0x04
 #define RMI_F34_WRITE_CONFIG_BLOCK			0x06
+#define RMI_F34_WRITE_SIGNATURE				0x0b
 #define RMI_F34_ENABLE_FLASH_PROG			0x0f
 
 #define RMI_F34_BLOCK_SIZE_OFFSET			1
@@ -124,13 +126,14 @@ fu_synaptics_rmi_v5_device_write_firmware (FuDevice *device,
 					   FwupdInstallFlags flags,
 					   GError **error)
 {
-
 	FuSynapticsRmiDevice *self = FU_SYNAPTICS_RMI_DEVICE (device);
 	FuSynapticsRmiFlash *flash = fu_synaptics_rmi_device_get_flash (self);
 	FuSynapticsRmiFunction *f34;
+	FuSynapticsRmiFirmware *rmi_firmware = FU_SYNAPTICS_RMI_FIRMWARE (firmware);
 	guint32 address;
 	g_autoptr(GBytes) bytes_bin = NULL;
 	g_autoptr(GBytes) bytes_cfg = NULL;
+	g_autoptr(GBytes) signature_bin = NULL;
 	g_autoptr(GPtrArray) chunks_bin = NULL;
 	g_autoptr(GPtrArray) chunks_cfg = NULL;
 	g_autoptr(GByteArray) req_addr = g_byte_array_new ();
@@ -149,6 +152,22 @@ fu_synaptics_rmi_v5_device_write_firmware (FuDevice *device,
 						    RMI_DEVICE_WAIT_FOR_IDLE_FLAG_REFRESH_F34,
 						    error)) {
 		g_prefix_error (error, "not idle: ");
+		return FALSE;
+	}
+	if (fu_synaptics_rmi_firmware_get_sig_size (rmi_firmware) == 0 &&
+	    fu_synaptics_rmi_device_get_sig_size (self) != 0) {
+		g_set_error_literal (error,
+				     FWUPD_ERROR,
+				     FWUPD_ERROR_INVALID_FILE,
+				     "device secure but firmware not secure");
+		return FALSE;
+	}
+	if (fu_synaptics_rmi_firmware_get_sig_size (rmi_firmware) != 0 &&
+	    fu_synaptics_rmi_device_get_sig_size (self) == 0) {
+		g_set_error_literal (error,
+				     FWUPD_ERROR,
+				     FWUPD_ERROR_INVALID_FILE,
+				     "device not secure but firmware secure");
 		return FALSE;
 	}
 
@@ -220,6 +239,36 @@ fu_synaptics_rmi_v5_device_write_firmware (FuDevice *device,
 					     (gsize) chunks_bin->len + chunks_cfg->len);
 	}
 
+	/* payload signature */
+	signature_bin = fu_firmware_get_image_by_id_bytes (firmware, "sig", NULL);
+	if (signature_bin != NULL &&
+	    fu_synaptics_rmi_device_get_sig_size (self) != 0) {
+		g_autoptr(GPtrArray) chunks_sig = NULL;
+		chunks_sig = fu_chunk_array_new_from_bytes (signature_bin,
+							    0x00,	/* start addr */
+							    0x00,	/* page_sz */
+							    flash->block_size);
+		if (!fu_synaptics_rmi_device_write (self, f34->data_base, req_addr, error)) {
+			g_prefix_error (error, "failed to write 1st address zero: ");
+			return FALSE;
+		}
+		for (guint i = 0; i < chunks_sig->len; i++) {
+			FuChunk *chk = g_ptr_array_index (chunks_sig, i);
+			if (!fu_synaptics_rmi_v5_device_write_block (self,
+								     RMI_F34_WRITE_SIGNATURE,
+								     address,
+								     chk->data,
+								     chk->data_sz,
+								     error)) {
+				g_prefix_error (error, "failed to write bin block %u: ", chk->idx);
+				return FALSE;
+			}
+			fu_device_set_progress_full (device, (gsize) i,
+						     (gsize) chunks_bin->len + chunks_cfg->len);
+		}
+		g_usleep (1000 * 1000);
+	}
+
 	/* program the configuration image */
 	if (!fu_synaptics_rmi_device_write (self, f34->data_base, req_addr, error)) {
 		g_prefix_error (error, "failed to 2nd write address zero: ");
@@ -250,8 +299,10 @@ fu_synaptics_rmi_v5_device_setup (FuSynapticsRmiDevice *self, GError **error)
 {
 	FuSynapticsRmiFunction *f34;
 	FuSynapticsRmiFlash *flash = fu_synaptics_rmi_device_get_flash (self);
+	guint8 flash_properties2 = 0;
 	g_autoptr(GByteArray) f34_data0 = NULL;
 	g_autoptr(GByteArray) f34_data2 = NULL;
+	g_autoptr(GByteArray) buf_flash_properties2 = NULL;
 
 	/* f34 */
 	f34 = fu_synaptics_rmi_device_get_function (self, 0x34, error);
@@ -266,6 +317,45 @@ fu_synaptics_rmi_v5_device_setup (FuSynapticsRmiDevice *self, GError **error)
 	}
 	flash->bootloader_id[0] = f34_data0->data[0];
 	flash->bootloader_id[1] = f34_data0->data[1];
+
+	/* get flash properties */
+	buf_flash_properties2 = fu_synaptics_rmi_device_read (self, f34->query_base + 0x9, 1, error);
+	if (buf_flash_properties2 == NULL) {
+		g_prefix_error (error, "failed to read Flash Properties 2: ");
+		return FALSE;
+	}
+	if (!fu_common_read_uint8_safe (buf_flash_properties2->data,
+					buf_flash_properties2->len,
+					0x0, /* offset */
+					&flash_properties2,
+					error)) {
+		g_prefix_error (error, "failed to parse Flash Properties 2: ");
+		return FALSE;
+	}
+	if (flash_properties2 & 0x01) {
+		guint16 sig_size = 0;
+		g_autoptr(GByteArray) buf_rsa_key = NULL;
+		buf_rsa_key = fu_synaptics_rmi_device_read (self,
+							    f34->query_base + 0x9 + 0x1,
+							    2,
+							    error);
+		if (buf_rsa_key == NULL) {
+			g_prefix_error (error, "failed to read RSA key length: ");
+			return FALSE;
+		}
+		if (!fu_common_read_uint16_safe (buf_rsa_key->data,
+						 buf_rsa_key->len,
+						 0x0, /* offset */
+						 &sig_size,
+						 G_LITTLE_ENDIAN,
+						 error)) {
+			g_prefix_error (error, "failed to parse RSA key length: ");
+			return FALSE;
+		}
+		fu_synaptics_rmi_device_set_sig_size (self, sig_size);
+	} else {
+		fu_synaptics_rmi_device_set_sig_size (self, 0);
+	}
 
 	/* get flash properties */
 	f34_data2 = fu_synaptics_rmi_device_read (self, f34->query_base + 0x2, 0x7, error);
