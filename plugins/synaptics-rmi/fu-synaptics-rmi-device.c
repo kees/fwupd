@@ -267,6 +267,19 @@ fu_synaptics_rmi_device_read (FuSynapticsRmiDevice *self, guint16 addr, gsize re
 	return g_steal_pointer (&buf);
 }
 
+GByteArray *
+fu_synaptics_rmi_device_read_packet_register (FuSynapticsRmiDevice *self,
+					      guint16 addr,
+					      gsize req_sz,
+					      GError **error)
+{
+	g_set_error_literal (error,
+			     FWUPD_ERROR,
+			     FWUPD_ERROR_NOT_SUPPORTED,
+			     "packet register reads not supported");
+	return NULL;
+}
+
 gboolean
 fu_synaptics_rmi_device_write (FuSynapticsRmiDevice *self, guint16 addr, GByteArray *req, GError **error)
 {

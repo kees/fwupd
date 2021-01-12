@@ -54,6 +54,10 @@ GByteArray		*fu_synaptics_rmi_device_read		(FuSynapticsRmiDevice	*self,
 								 guint16		 addr,
 								 gsize			 req_sz,
 								 GError			**error);
+GByteArray		*fu_synaptics_rmi_device_read_packet_register (FuSynapticsRmiDevice	*self,
+								 guint16		 addr,
+								 gsize			 req_sz,
+								 GError			**error);
 gboolean		 fu_synaptics_rmi_device_write		(FuSynapticsRmiDevice	*self,
 								 guint16		 addr,
 								 GByteArray		*req,

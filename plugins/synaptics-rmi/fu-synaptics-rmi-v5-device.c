@@ -8,6 +8,11 @@
 
 #include "config.h"
 
+#ifdef HAVE_GNUTLS
+#include <gnutls/abstract.h>
+#include <gnutls/crypto.h>
+#endif
+
 #include "fu-chunk.h"
 #include "fu-common.h"
 #include "fu-synaptics-rmi-firmware.h"
@@ -27,6 +32,15 @@
 #define RMI_F34_CONFIG_BLOCKS_OFFSET			5
 
 #define RMI_F34_ERASE_WAIT_MS				(5 * 1000)	/* ms */
+
+#ifdef HAVE_GNUTLS
+typedef guchar gnutls_data_t;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-function"
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(gnutls_data_t, gnutls_free)
+G_DEFINE_AUTO_CLEANUP_FREE_FUNC(gnutls_pubkey_t, gnutls_pubkey_deinit, NULL)
+#pragma clang diagnostic pop
+#endif
 
 gboolean
 fu_synaptics_rmi_v5_device_detach (FuDevice *device, GError **error)
@@ -120,6 +134,148 @@ fu_synaptics_rmi_v5_device_write_block (FuSynapticsRmiDevice *self,
 	return TRUE;
 }
 
+static gboolean
+fu_synaptics_rmi_v5_device_secure_check (FuDevice *device,
+					 GBytes *payload,
+					 GBytes *signature,
+					 GError **error)
+{
+#ifdef HAVE_GNUTLS
+	FuSynapticsRmiDevice *self = FU_SYNAPTICS_RMI_DEVICE (device);
+	FuSynapticsRmiFunction *f34;
+	gnutls_datum_t hash;
+	gnutls_datum_t m;
+	gnutls_datum_t e;
+	gnutls_datum_t sig;
+	gnutls_hash_hd_t sha2;
+	g_auto(gnutls_pubkey_t) pub = NULL;
+	gint ec;
+	guint16 rsa_pubkey_len = fu_synaptics_rmi_device_get_sig_size (self) / 8;
+	guint16 rsa_block_cnt = rsa_pubkey_len / 3;
+	guint16 rsa_block_remain = rsa_pubkey_len % 3;
+	guint8 exponent[] = { 1, 0, 1 };
+	guint hash_length = gnutls_hash_get_len (GNUTLS_DIG_SHA256);
+	g_autoptr(GByteArray) rsadump = g_byte_array_new ();
+	g_autoptr(GByteArray) rsaseg = NULL;
+	g_autoptr(gnutls_data_t) hash_data = NULL;
+
+	if (g_getenv ("FWUPD_SYNAPTICS_RMI_VERBOSE") != NULL)
+		fu_common_dump_bytes (G_LOG_DOMAIN, "Signature", signature);
+
+	f34 = fu_synaptics_rmi_device_get_function (self, 0x34, error);
+	if (f34 == NULL)
+		return FALSE;
+
+	/* parse RSA public key modulus */
+	if (rsa_block_remain > 0)
+		rsa_block_cnt += 1;
+	for (guint retries = 0; ; retries++) {
+		/* need read another register to reset the offset of packet register */
+		if (!fu_synaptics_rmi_v5_device_query_status (self, error)) {
+			g_prefix_error (error, "failed to read status: ");
+			return FALSE;
+		}
+		for (guint16 block_num = 0; block_num < rsa_block_cnt; block_num++) {
+			g_autoptr(GByteArray) res = NULL;
+			res = fu_synaptics_rmi_device_read_packet_register (self,
+									    f34->query_base + 14, /* addr of flash properties + 5 */
+									    0x3,
+									    error);
+			if (res == NULL)
+				return FALSE;
+			if (res->len != 0x3)
+				g_debug ("read %u bytes in return", res->len);
+			if (rsa_block_remain && block_num + 1 == rsa_block_cnt) {
+				g_byte_array_remove_range (res,
+							   rsa_block_remain,
+							   res->len - rsa_block_remain);
+			}
+			for (guint i = 0 ; i < res->len / 2 ; i++) {
+				guint8 tmp = res->data[i];
+				res->data[i] = res->data[res->len - i - 1];
+				res->data[res->len - i - 1] = tmp;
+			}
+			if (rsa_block_remain && block_num + 1 == rsa_block_cnt) {
+				g_byte_array_prepend (rsadump, res->data, rsa_block_remain);
+			} else {
+				g_byte_array_prepend (rsadump, res->data, res->len);
+			}
+		}
+		if (rsa_pubkey_len != rsadump->len) {
+			if (retries++ > 2) {
+				g_set_error (error,
+					     G_IO_ERROR, G_IO_ERROR_FAILED,
+					     "RSA public key length not matched %u: after %u retries: ",
+					     rsadump->len, retries);
+				return FALSE;
+			}
+			g_byte_array_set_size (rsadump, 0);
+			continue;
+		}
+
+		/* success */
+		break;
+	}
+	if (g_getenv ("FWUPD_SYNAPTICS_RMI_VERBOSE") != NULL) {
+		fu_common_dump_full (G_LOG_DOMAIN, "RSA public key",
+				     rsadump->data, rsadump->len,
+				     16, FU_DUMP_FLAGS_NONE);
+	}
+
+	/* sanity check size */
+	if (rsa_pubkey_len != rsadump->len) {
+		g_set_error (error,
+			     FWUPD_ERROR,
+			     FWUPD_ERROR_NOT_SUPPORTED,
+			     "RSA public key length did not match: %u != %u: ",
+			     rsa_pubkey_len, rsadump->len);
+		return FALSE;
+	}
+
+	/* hash firmware data */
+	hash_data = gnutls_malloc (hash_length);
+	gnutls_hash_init (&sha2, GNUTLS_DIG_SHA256);
+	gnutls_hash (sha2, g_bytes_get_data (payload, NULL), g_bytes_get_size (payload));
+	gnutls_hash_deinit (sha2, hash_data);
+
+	/* hash */
+	hash.size = hash_length;
+	hash.data = hash_data;
+
+	/* modulus */
+	m.size = rsadump->len;
+	m.data = rsadump->data;
+
+	/* exponent */
+	e.size = sizeof(exponent);
+	e.data = exponent;
+
+	/* signature */
+	sig.size = g_bytes_get_size (signature);
+	sig.data = (guint8 *) g_bytes_get_data (signature, NULL);
+
+	gnutls_pubkey_init (&pub);
+	ec = gnutls_pubkey_import_rsa_raw (pub, &m, &e);
+	if (ec < 0) {
+		g_prefix_error (error, "failed to import RSA key: ");
+		return FALSE;
+	}
+	ec = gnutls_pubkey_verify_hash2 (pub, GNUTLS_SIGN_RSA_SHA256,
+					 0, &hash, &sig);
+	if (ec < 0) {
+		g_set_error_literal (error,
+				     FWUPD_ERROR,
+				     FWUPD_ERROR_NOT_SUPPORTED,
+				     "failed to verify firmware");
+		return FALSE;
+	}
+#endif
+	/* IMPORTANT: the signature test is performed on the device *AS WELL*
+	 * and checking the signature here just verifies the firmware will
+	 * flash correctly rather than leave the device in bootloader mode */
+	return TRUE;
+}
+
 gboolean
 fu_synaptics_rmi_v5_device_write_firmware (FuDevice *device,
 					   FuFirmware *firmware,
@@ -184,6 +340,18 @@ fu_synaptics_rmi_v5_device_write_firmware (FuDevice *device,
 	if (bytes_cfg == NULL)
 		return FALSE;
 
+	/* verify signature if set */
+	signature_bin = fu_firmware_get_image_by_id_bytes (firmware, "sig", NULL);
+	if (signature_bin != NULL) {
+		if (!fu_synaptics_rmi_v5_device_secure_check (device,
+							      bytes_bin,
+							      signature_bin,
+							      error)) {
+			g_prefix_error (error, "secure check failed: ");
+			return FALSE;
+		}
+	}
+
 	/* disable powersaving */
 	if (!fu_synaptics_rmi_device_disable_sleep (self, error)) {
 		g_prefix_error (error, "failed to disable sleep: ");
@@ -240,7 +408,6 @@ fu_synaptics_rmi_v5_device_write_firmware (FuDevice *device,
 	}
 
 	/* payload signature */
-	signature_bin = fu_firmware_get_image_by_id_bytes (firmware, "sig", NULL);
 	if (signature_bin != NULL &&
 	    fu_synaptics_rmi_device_get_sig_size (self) != 0) {
 		g_autoptr(GPtrArray) chunks_sig = NULL;
