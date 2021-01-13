@@ -212,7 +212,10 @@ else
   gudev = dependency('', required : false)
 endif
 libxmlb = dependency('xmlb', version : '>= 0.1.13', fallback : ['libxmlb', 'libxmlb_dep'])
-gusb = dependency('gusb', version : '>= 0.3.5', fallback : ['gusb', 'gusb_dep'])
+if get_option('gusb')
+  gusb = dependency('gusb', version : '>= 0.3.5', fallback : ['gusb', 'gusb_dep'])
+  conf.set('HAVE_GUSB', '1')
+endif
 sqlite = dependency('sqlite3')
 if get_option('libarchive')
   libarchive = dependency('libarchive')
@@ -482,9 +485,12 @@ if build_standalone
   plugin_deps += gio
   plugin_deps += giounix
   plugin_deps += gmodule
-  plugin_deps += gusb
   plugin_deps += gudev
   plugin_deps += libjsonglib
+endif
+
+if get_option('gusb')
+  plugin_deps += gusb
 endif
 
 if get_option('libarchive')
