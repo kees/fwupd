@@ -28,7 +28,7 @@ fi
 
 # Clean up from fwupdate->fwupd transition
 # This can be removed after bullseye and focal are released
-EFIDIR=$(dpkg-vendor --query vendor | awk '{ print tolower($$0) }')
+EFIDIR=$(lsb_release -is | awk '{ print tolower($$0) }')
 if [ "${DPKG_MAINTSCRIPT_ARCH}" = "amd64" ]; then
 	EFI_NAME=x64
 elif [ "${DPKG_MAINTSCRIPT_ARCH}" = "i386" ]; then
